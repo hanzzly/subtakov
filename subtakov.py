@@ -1,12 +1,4 @@
 #!/usr/bin/env python3
-"""
-SubTakeover - Subdomain Takeover Detection Tool
-Usage:
-    python subtakeover.py -d sub.target.com
-    python subtakeover.py -l subdomains.txt
-    python subtakeover.py -l subdomains.txt -o hasil.txt -t 20
-"""
-
 import argparse
 import asyncio
 import re
@@ -54,7 +46,6 @@ FINGERPRINTS = {
     'strikingly'    : r"Page not found",
     'discord'       : r"Invalid invite",
     'slack'         : r"Workspace not found",
-    # Tambahan
     'pantheon'      : r"The gods are wise|404 error unknown site",
     'kinsta'        : r"No Site For Domain",
     'acquia'        : r"The site you are looking for could not be found",
