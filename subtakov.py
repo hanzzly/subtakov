@@ -2,7 +2,6 @@
 import argparse
 import re
 import sys
-import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -12,6 +11,13 @@ try:
     import httpx
 except ImportError:
     print("[!] httpx not found. Install: pip install httpx")
+    sys.exit(1)
+
+try:
+    import dns.resolver
+    import dns.name
+except ImportError:
+    print("[!] dnspython not found. Install: pip install dnspython")
     sys.exit(1)
 
 # ──────────────────────────────────────────────
@@ -97,110 +103,59 @@ def banner() -> None:
 """)
 
 # ──────────────────────────────────────────────
-# DNS CHECK (with fallback and CNAME cache)
+# DNS CHECK (dns.resolver + CNAME cache)
 # ──────────────────────────────────────────────
 _cname_cache: dict[str, Optional[str]] = {}
-
-def _dig_cname(subdomain: str) -> Optional[str]:
-    """Ambil CNAME record via dig."""
-    try:
-        result = subprocess.run(
-            ["dig", "CNAME", subdomain, "+short"],
-            capture_output=True, text=True, timeout=10
-        )
-        cname = result.stdout.strip()
-        return cname if cname else None
-    except subprocess.TimeoutExpired:
-        print(f"  {C.DIM}[dig] timeout for {subdomain}{C.RESET}")
-        return None
-    except FileNotFoundError:
-        return None  # dig not available, caller will try fallback
-
-def _nslookup_cname(subdomain: str) -> Optional[str]:
-    """Fallback: ambil CNAME via nslookup jika dig tidak tersedia."""
-    try:
-        result = subprocess.run(
-            ["nslookup", "-type=CNAME", subdomain],
-            capture_output=True, text=True, timeout=10
-        )
-        # Parse nslookup output for canonical name
-        for line in result.stdout.splitlines():
-            line_lower = line.strip().lower()
-            if "canonical name" in line_lower:
-                # Format: "subdomain canonical name = target.example.com"
-                match = re.search(r"canonical name\s*=\s*(\S+)", line, re.IGNORECASE)
-                if match:
-                    return match.group(1)
-        return None
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        return None
+_resolver = dns.resolver.Resolver()
+_resolver.timeout = 5
+_resolver.lifetime = 5
 
 def get_cname(subdomain: str) -> Optional[str]:
-    """Ambil CNAME record dengan caching + fallback ke nslookup."""
+    """Ambil CNAME record via dns.resolver dengan caching."""
     if subdomain in _cname_cache:
         return _cname_cache[subdomain]
 
-    cname = _dig_cname(subdomain)
-
-    # Fallback ke nslookup kalau dig gagal / not found
-    if cname is None:
-        cname = _nslookup_cname(subdomain)
-        if cname is None:
-            # Masih None? Bisa jadi memang gak ada CNAME, atau kedua tools gagal
-            pass
-
-    # Strip trailing dot (bikin mismatch kalau gak di-strip)
-    if cname:
-        cname = cname.rstrip(".")
+    cname: Optional[str] = None
+    try:
+        answers = _resolver.resolve(subdomain, "CNAME")
+        # Ambil CNAME pertama, strip trailing dot
+        cname = str(answers[0].target).rstrip(".")
+    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN):
+        pass  # Gak ada CNAME record, normal
+    except dns.resolver.NoNameservers:
+        pass  # DNS server gak respond
+    except dns.resolver.LifetimeTimeout:
+        pass  # Query timeout
+    except Exception:
+        pass
 
     _cname_cache[subdomain] = cname
     return cname
 
 def is_nxdomain(domain: str) -> bool:
-    """Cek apakah domain resolve ke NXDOMAIN."""
+    """Cek apakah domain NXDOMAIN (gak resolve ke IP apapun)."""
     try:
-        result = subprocess.run(
-            ["dig", domain, "+short"],
-            capture_output=True, text=True, timeout=10
-        )
-        output = result.stdout.strip()
-        return output == ""
-    except subprocess.TimeoutExpired:
-        return False
-    except FileNotFoundError:
-        # Fallback nslookup
+        _resolver.resolve(domain, "A")
+        return False  # Resolve berhasil = bukan NXDOMAIN
+    except dns.resolver.NXDOMAIN:
+        return True  # Pasti NXDOMAIN
+    except dns.resolver.NoAnswer:
+        # Ada record tapi bukan A record, coba AAAA
         try:
-            result = subprocess.run(
-                ["nslookup", domain],
-                capture_output=True, text=True, timeout=10
-            )
-            # Kalau ada "can't find" atau "NXDOMAIN" di stderr/stdout -> NXDOMAIN
-            combined = result.stdout + result.stderr
-            if "can't find" in combined.lower() or "nxdomain" in combined.lower():
-                return True
+            _resolver.resolve(domain, "AAAA")
             return False
-        except (subprocess.TimeoutExpired, FileNotFoundError):
-            print(f"  {C.YELLOW}[!] Neither dig nor nslookup available. DNS checks will be unreliable.{C.RESET}")
+        except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
+            return True
+        except Exception:
             return False
+    except dns.resolver.LifetimeTimeout:
+        return False  # Timeout != NXDOMAIN, jangan false positive
+    except Exception:
+        return False
 
 # ──────────────────────────────────────────────
-# HTTP PROBE (reusable client + retry)
+# HTTP PROBE (per-call client + retry)
 # ──────────────────────────────────────────────
-_http_client: Optional[httpx.Client] = None
-
-def _get_http_client(timeout: int = 10) -> httpx.Client:
-    """Get or create a reusable httpx.Client."""
-    global _http_client
-    if _http_client is None or _http_client.is_closed:
-        _http_client = httpx.Client(
-            verify=False,
-            follow_redirects=True,
-            timeout=timeout,
-            headers={"User-Agent": "Mozilla/5.0 SubTakeover/2.0"},
-            limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
-        )
-    return _http_client
-
 def http_probe(
     subdomain: str,
     timeout: int = 10,
@@ -211,31 +166,37 @@ def http_probe(
     Probe HTTP/HTTPS, return (status_code, body, error_type).
     error_type: None jika sukses, "timeout", "connection", "unknown" jika gagal.
     Retry 1x jika request gagal.
+    Client dibuat per-call supaya thread-safe (no shared connection pool).
     """
     if skip_http:
         return None, "", None
 
-    client = _get_http_client(timeout)
     last_error_type: Optional[str] = None
 
-    for scheme in ["https", "http"]:
-        url = f"{scheme}://{subdomain}"
-        for attempt in range(1 + max_retries):
-            try:
-                r = client.get(url)
-                return r.status_code, r.text, None
-            except httpx.TimeoutException:
-                last_error_type = "timeout"
-            except httpx.ConnectError:
-                last_error_type = "connection"
-            except httpx.HTTPError:
-                last_error_type = "http_error"
-            except Exception:
-                last_error_type = "unknown"
+    with httpx.Client(
+        verify=False,
+        follow_redirects=True,
+        timeout=timeout,
+        headers={"User-Agent": "Mozilla/5.0 SubTakeover/2.0"},
+    ) as client:
+        for scheme in ["https", "http"]:
+            url = f"{scheme}://{subdomain}"
+            for attempt in range(1 + max_retries):
+                try:
+                    r = client.get(url)
+                    return r.status_code, r.text, None
+                except httpx.TimeoutException:
+                    last_error_type = "timeout"
+                except httpx.ConnectError:
+                    last_error_type = "connection"
+                except httpx.HTTPError:
+                    last_error_type = "http_error"
+                except Exception:
+                    last_error_type = "unknown"
 
-            # Kalau masih ada retry, tunggu sebentar
-            if attempt < max_retries:
-                time.sleep(0.5)
+                # Kalau masih ada retry, tunggu sebentar
+                if attempt < max_retries:
+                    time.sleep(0.5)
 
     return None, "", last_error_type
 
@@ -277,7 +238,6 @@ def check_subdomain(subdomain: str, timeout: int = 10) -> dict:
         "service"   : None,
         "vulnerable": False,
         "note"      : "",
-        "error"     : None,
     }
 
     # Step 1: CNAME (cached)
@@ -295,7 +255,6 @@ def check_subdomain(subdomain: str, timeout: int = 10) -> dict:
     # Step 3: HTTP probe + fingerprint match
     status, body, error_type = http_probe(subdomain, timeout, skip_http=skip_http)
     result["status"] = status
-    result["error"] = error_type
 
     if body:
         service = match_fingerprint(body, status)
@@ -304,23 +263,14 @@ def check_subdomain(subdomain: str, timeout: int = 10) -> dict:
             result["vulnerable"] = True
             result["note"]       = f"Fingerprint matched: {service} (HTTP {status})"
 
-    # Kalau NXDOMAIN tapi gak ada fingerprint, tetap flag sebagai suspect
+    # Klasifikasi suspect:
+    # 1. CNAME -> NXDOMAIN (domain target gak resolve)
+    # 2. CNAME ada tapi HTTP unreachable (service mungkin mati/bisa di-claim)
     if result["nxdomain"] and not result["vulnerable"]:
-        result["note"] = "CNAME pointing to NXDOMAIN (unconfirmed, manual check needed)"
-
-    # Tambah error info jika ada
-    if error_type and not result["vulnerable"]:
-        error_msgs = {
-            "timeout":    "HTTP request timed out",
-            "connection": "Connection refused / unreachable",
-            "http_error": "HTTP protocol error",
-            "unknown":    "Unknown error during HTTP probe",
-        }
-        error_note = error_msgs.get(error_type, error_type)
-        if result["note"]:
-            result["note"] += f" | {error_note}"
-        else:
-            result["note"] = error_note
+        result["note"] = "CNAME -> NXDOMAIN (manual check needed)"
+    elif cname and error_type in ("connection", "timeout") and not result["vulnerable"]:
+        result["nxdomain"] = True  # treat as suspect
+        result["note"] = f"CNAME exists but HTTP unreachable ({error_type})"
 
     return result
 
@@ -333,21 +283,18 @@ def print_result(r: dict) -> None:
     status  = r["status"] or "-"
     service = r["service"] or "-"
     note    = r["note"]
-    error   = r.get("error")
 
     if r["vulnerable"]:
         tag = f"{C.RED}{C.BOLD}[VULN]{C.RESET}"
     elif r["nxdomain"]:
         tag = f"{C.YELLOW}[SUSPECT]{C.RESET}"
-    elif error:
-        tag = f"{C.DIM}[ERROR]{C.RESET}"
     else:
         tag = f"{C.DIM}[SAFE]{C.RESET}"
 
     print(f"  {tag} {C.BOLD}{sub}{C.RESET}")
-    print(f"        CNAME  : {C.CYAN}{cname}{C.RESET}")
-    print(f"        Status : {status}")
-    if r["vulnerable"] or r["nxdomain"] or error:
+    if r["vulnerable"] or r["nxdomain"]:
+        print(f"        CNAME  : {C.CYAN}{cname}{C.RESET}")
+        print(f"        Status : {status}")
         if r["vulnerable"]:
             print(f"        Service: {C.GREEN}{service}{C.RESET}")
         if note:
@@ -357,7 +304,6 @@ def print_result(r: dict) -> None:
 def save_results(results: list[dict], outfile: str, elapsed: float) -> None:
     vuln    = [r for r in results if r["vulnerable"]]
     suspect = [r for r in results if r["nxdomain"] and not r["vulnerable"]]
-    errors  = [r for r in results if r.get("error") and not r["vulnerable"]]
 
     with open(outfile, "w") as f:
         f.write(f"SubTakeover Report - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
@@ -370,12 +316,7 @@ def save_results(results: list[dict], outfile: str, elapsed: float) -> None:
 
         f.write(f"\n[SUSPECT - Manual Check] ({len(suspect)} found)\n")
         for r in suspect:
-            f.write(f"  {r['subdomain']} -> {r['cname']}\n")
-
-        if errors:
-            f.write(f"\n[ERRORS] ({len(errors)} found)\n")
-            for r in errors:
-                f.write(f"  {r['subdomain']} -> {r.get('error', 'unknown')}\n")
+            f.write(f"  {r['subdomain']} -> {r['cname']} | {r['note']}\n")
 
         f.write(f"\n[ALL RESULTS]\n")
         for r in results:
@@ -423,7 +364,6 @@ def main() -> None:
     results: list[dict] = []
     vuln_count     = 0
     suspect_count  = 0
-    error_count    = 0
     start_time     = time.time()
 
     try:
@@ -437,7 +377,7 @@ def main() -> None:
                     r = {
                         "subdomain": target, "cname": None, "nxdomain": False,
                         "status": None, "service": None, "vulnerable": False,
-                        "note": f"Unhandled exception: {exc}", "error": "exception",
+                        "note": f"Unhandled exception: {exc}",
                     }
                 results.append(r)
                 print_result(r)
@@ -445,8 +385,6 @@ def main() -> None:
                     vuln_count += 1
                 elif r["nxdomain"]:
                     suspect_count += 1
-                if r.get("error"):
-                    error_count += 1
 
                 # Progress
                 sys.stdout.write(f"\r  {C.DIM}Progress: {i}/{len(targets)}{C.RESET}  ")
@@ -467,19 +405,12 @@ def main() -> None:
     print(f"   {C.RED}{C.BOLD}Vulnerable    : {vuln_count}{C.RESET}")
     print(f"   {C.YELLOW}Suspect       : {suspect_count}{C.RESET}")
     print(f"   Safe          : {safe_count}")
-    if error_count:
-        print(f"   {C.DIM}Errors        : {error_count}{C.RESET}")
     print(f"   Duration      : {elapsed:.1f}s")
     print(f"  {'─'*50}")
     print()
 
     if args.output:
         save_results(results, args.output, elapsed)
-
-    # Cleanup client
-    global _http_client
-    if _http_client and not _http_client.is_closed:
-        _http_client.close()
 
 if __name__ == "__main__":
     import urllib3
